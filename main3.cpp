@@ -6,6 +6,7 @@
 #include <iostream>
 #include <array>
 #include <vector>
+#include <unordered_set>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -14,7 +15,6 @@
 using namespace std::literals::string_view_literals;
 
 enum class OpType : size_t {
-    UNREACHABLE,
     INVALID_REPETITION_UNMATCHED,
     INVALID_REPETITION_CHAR,
     INVALID_REPETITION_COMMA_MORE_THAN_ONE,
@@ -446,7 +446,7 @@ std::string_view scan_group_implicit(std::string_view input) {
     if (pos_find == std::string_view::npos) return input;
 
     auto c = input[pos_find];
-    size_t pos_end = (split.contains(c) && pos_find > 0) ? (pos_find - 1) : (pos_find);
+    size_t pos_end = (split.contains(c) && pos_find > 1) ? (pos_find - 1) : (pos_find);
     return input.substr(0, pos_end);
 }
 
@@ -545,6 +545,121 @@ std::unique_ptr<Expr> parse(std::string_view input) {
     return std::move(root);
 }
 
+bool is_number(const std::string& s) {
+    return !s.empty() && std::all_of(s.begin(), s.end(), ::isdigit);
+}
+
+void merge_eqs(std::vector<std::string>& lhs, const std::vector<std::string>& rhs) {
+    std::unordered_set<std::string> unique_eqs(lhs.begin(), lhs.end());
+    
+    for (const auto& eq : rhs) {
+        if (unique_eqs.insert(eq).second) {
+            lhs.push_back(eq);
+        }
+    }
+}
+
+std::string_view scan_const(std::string_view input) {
+    auto maybe_const = scan_number(input);
+    auto rest = input.substr(maybe_const.size());
+    return (rest.empty() || rest[0] == '+') ?
+           (maybe_const) :
+           ("");
+}
+
+void cart_prod_pair_sum_eqs(std::vector<std::string>& lhs, const std::vector<std::string>& rhs) {
+    std::unordered_set<std::string> unique_sums;
+    std::vector<std::string> new_lhs;
+
+    for (std::string left : lhs) {
+        auto left_const = scan_const(left);
+        auto left_expr = left.substr(left_const.size());
+
+        size_t left_val = 0;
+        std::from_chars(left_const.data(), left_const.data() + left_const.size(), left_val);
+
+        for (std::string right : rhs) {
+            auto right_const = scan_const(right);
+            auto right_expr = right.substr(right_const.size());
+
+            size_t right_val = 0;
+            std::from_chars(right_const.data(), right_const.data() + right_const.size(), right_val);
+
+            int combined_const = left_val + right_val;
+            std::string final_expr = std::to_string(combined_const) +
+                                     (!left_expr.empty() && (left_expr[0] != '+') ? ("+") : ("")) +
+                                     std::string(left_expr) +
+                                     (!right_expr.empty() && (right[0] != '+') ? ("+") : ("")) +
+                                     std::string(right_expr);
+
+            if (unique_sums.insert(final_expr).second) {
+                new_lhs.push_back(std::move(final_expr));
+            }
+        }
+    }
+    lhs = new_lhs;
+}
+
+void scalar_mult_eqs(std::vector<std::string>& eqs, const std::string& c) {
+    for (auto& eq : eqs) {
+        eq = "(" + eq + ")" + "*" + c;
+    }
+}
+
+std::vector<std::string> gen_eqs(Expr& expr, size_t& var_count) {
+    if (expr.children.empty()) {
+        if (expr.op_type == OpType::CONCATENATION || expr.op_type == OpType::ALTERNATION) {
+            return std::vector<std::string>{std::to_string(expr.group.size())}; 
+        }
+        else {
+            auto n = std::to_string(expr.n);
+            auto m = std::to_string(expr.m);
+            auto count = std::to_string(var_count++);
+            auto var = "{x" + count + ":" + n + "," + m + "}";
+            return std::vector<std::string>{var}; 
+        }
+    }
+    Expr& first = *expr.children[0];
+    std::vector<std::string> eqs = gen_eqs(first, var_count);
+    OpType op_type = first.op_type;
+    size_t max = expr.children.size();
+    for (size_t i = 1; i < max; i++) {
+        Expr& ch = *expr.children[i];
+        auto ch_eqs = gen_eqs(ch, var_count);
+        switch (op_type) {
+            case OpType::ALTERNATION: {
+                merge_eqs(eqs, ch_eqs); break;
+            }
+            case OpType::CONCATENATION: {
+                cart_prod_pair_sum_eqs(eqs, ch_eqs); break;
+            }
+            case OpType::ONE: {
+                cart_prod_pair_sum_eqs(eqs, ch_eqs); break;
+            }
+            default: {
+                auto n = std::to_string(expr.n);
+                auto m = std::to_string(expr.m);
+                auto count = std::to_string(var_count++);
+                auto var = "{x" + count + ":" + n + "," + m + "}";
+                scalar_mult_eqs(eqs, var);
+                break;
+            }
+        }
+        op_type = ch.op_type;
+    }
+    if (expr.op_type == OpType::CONCATENATION || expr.op_type == OpType::ONE || expr.op_type == OpType::ALTERNATION) {
+        return eqs;
+    }
+    else {
+        auto n = std::to_string(expr.n);
+        auto m = std::to_string(expr.m);
+        auto count = std::to_string(var_count++);
+        auto var = "{x" + count + ":" + n + "," + m + "}";
+        scalar_mult_eqs(eqs, var);
+        return eqs;
+    }
+}
+
 // Function to print parsed expressions for debugging
 void print_expr(const Expr& expr, int indent = 0) {
     std::string padding(indent * 2, ' ');
@@ -626,11 +741,20 @@ void test_parse() {
         auto expr = parse("[[:alnum:]\\x61-\\x7A\t]");
     }
 
-    std::cout << "All tests passed!\n";
 }
 
 int main() {
-    test_parse();
+    // test_parse();
+    {
+        std::string input = "((a|bc|d{1,5})(e|fg|h{2,3})){4,6}";
+        std::cout << "parsing " << input << std::endl;
+        auto expr = parse(input);
+        print_expr(*expr, 0);
+        size_t count = 0;
+        auto eqs = gen_eqs(*expr, count);
+        std::cout << "equations" << std::endl;
+        for (auto& eq : eqs) std::cout << eq << std::endl;
+    }
     return 0;
 }
 
