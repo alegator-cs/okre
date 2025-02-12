@@ -10,6 +10,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <sstream>
 #include <charconv>
   
 using namespace std::literals::string_view_literals;
@@ -551,7 +552,6 @@ bool is_number(const std::string& s) {
 
 void merge_eqs(std::vector<std::string>& lhs, const std::vector<std::string>& rhs) {
     std::unordered_set<std::string> unique_eqs(lhs.begin(), lhs.end());
-    
     for (const auto& eq : rhs) {
         if (unique_eqs.insert(eq).second) {
             lhs.push_back(eq);
@@ -570,29 +570,29 @@ std::string_view scan_const(std::string_view input) {
 void cart_prod_pair_sum_eqs(std::vector<std::string>& lhs, const std::vector<std::string>& rhs) {
     std::unordered_set<std::string> unique_sums;
     std::vector<std::string> new_lhs;
-
     for (std::string left : lhs) {
         auto left_const = scan_const(left);
         auto left_expr = left.substr(left_const.size());
-
         size_t left_val = 0;
         std::from_chars(left_const.data(), left_const.data() + left_const.size(), left_val);
-
         for (std::string right : rhs) {
             auto right_const = scan_const(right);
             auto right_expr = right.substr(right_const.size());
-
             size_t right_val = 0;
             std::from_chars(right_const.data(), right_const.data() + right_const.size(), right_val);
-
             int combined_const = left_val + right_val;
-            std::string final_expr = std::to_string(combined_const) +
-                                     (!left_expr.empty() && (left_expr[0] != '+') ? ("+") : ("")) +
+            std::string final_expr = ((combined_const != 0) ?
+                                         (std::to_string(combined_const)) :
+                                         ("")) +
+                                     ((!left_expr.empty() && (left_expr[0] != '+') && combined_const != 0) ?
+                                         ("+") :
+                                         ("")) +
                                      std::string(left_expr) +
-                                     (!right_expr.empty() && (right[0] != '+') ? ("+") : ("")) +
+                                     ((!right_expr.empty() && (right[0] != '+')) ?
+                                         ("+") :
+                                         ("")) +
                                      std::string(right_expr);
-
-            if (unique_sums.insert(final_expr).second) {
+            if (!final_expr.empty() && unique_sums.insert(final_expr).second) {
                 new_lhs.push_back(std::move(final_expr));
             }
         }
@@ -602,13 +602,33 @@ void cart_prod_pair_sum_eqs(std::vector<std::string>& lhs, const std::vector<std
 
 void scalar_mult_eqs(std::vector<std::string>& eqs, const std::string& c) {
     for (auto& eq : eqs) {
-        eq = "(" + eq + ")" + "*" + c;
+        size_t last_pos = 0;
+        size_t pos = 0;
+        std::string_view term;
+        while ((pos = eq.find('+', pos)) != std::string::npos) {
+            term = eq.substr(last_pos, pos);
+            if (term[0] == '{') {
+                eq.insert(last_pos, "1");
+                pos++;
+            }
+            eq.insert(pos, c);
+            pos += c.length() + 1;
+            last_pos = pos;
+        }
+        term = eq.substr(last_pos);
+        if (term[0] == '{') {
+            eq.insert(last_pos, "1");
+            pos++;
+        }
+        eq += c;
     }
 }
 
 std::vector<std::string> gen_eqs(Expr& expr, size_t& var_count) {
     if (expr.children.empty()) {
-        if (expr.op_type == OpType::CONCATENATION || expr.op_type == OpType::ALTERNATION) {
+        if (expr.op_type == OpType::CONCATENATION ||
+            expr.op_type == OpType::ONE ||
+            expr.op_type == OpType::ALTERNATION) {
             return std::vector<std::string>{std::to_string(expr.group.size())}; 
         }
         else {
@@ -647,7 +667,9 @@ std::vector<std::string> gen_eqs(Expr& expr, size_t& var_count) {
         }
         op_type = ch.op_type;
     }
-    if (expr.op_type == OpType::CONCATENATION || expr.op_type == OpType::ONE || expr.op_type == OpType::ALTERNATION) {
+    if (expr.op_type == OpType::CONCATENATION ||
+        expr.op_type == OpType::ONE || 
+        expr.op_type == OpType::ALTERNATION) {
         return eqs;
     }
     else {
@@ -658,6 +680,66 @@ std::vector<std::string> gen_eqs(Expr& expr, size_t& var_count) {
         scalar_mult_eqs(eqs, var);
         return eqs;
     }
+}
+
+// ------------------------------------------------------------------
+// Helper: convert generated equation string to solver format.
+// Our internal format looks like:
+//    "1*{x0:3,3}*{x1:1,1}+2*{x1:0,3}*{x2:2,5}=9"
+// We want to convert that to:
+//    "1*x0*x1+2*x1*x2=9"
+// That is, remove each brace-enclosed bound, leaving only the variable name.
+// ------------------------------------------------------------------
+std::string format_eq(const std::string &eq, std::string& input) {
+    std::string result;
+    result.reserve(eq.size());
+    // We scan the string character by character.
+    for (size_t i = 0; i < eq.size(); ++i) {
+        char c = eq[i];
+        if (c == '{') {
+            // We assume the format is "{<var>:<n>,<m>}"
+            // Find the colon and then the closing brace.
+            size_t colonPos = eq.find(':', i);
+            size_t closePos = eq.find('}', i);
+            if (colonPos == std::string::npos || closePos == std::string::npos) {
+                // If something is wrong, copy the rest and break.
+                result.append(eq.substr(i));
+                break;
+            }
+            // Append the substring from after '{' up to the colon.
+            result.append("*");
+            result.append(eq.substr(i+1, colonPos - i - 1));
+            // Skip ahead past the closing brace.
+            i = closePos;
+        } else {
+            result.push_back(c);
+        }
+    }
+    result.append("=" + std::to_string(input.size()));
+    return result;
+}
+
+// ------------------------------------------------------------------
+// Helper: call the Python solver program (solver.py)
+// with a given equation string (in solver format) as an argument,
+// capture its output and return it as a string.
+// ------------------------------------------------------------------
+std::string solve_eq(const std::string &equation) {
+    // Construct command. We enclose the equation in quotes.
+    std::string command = "python solver.py \"" + equation + "\"";
+    FILE *pipe = popen(command.c_str(), "r");
+    if (!pipe) {
+        std::cerr << "Error: Unable to run solver.py." << std::endl;
+        return "";
+    }
+    const int bufSize = 256;
+    char buffer[bufSize];
+    std::stringstream output;
+    while (fgets(buffer, bufSize, pipe) != nullptr) {
+        output << buffer;
+    }
+    pclose(pipe);
+    return output.str();
 }
 
 // Function to print parsed expressions for debugging
@@ -744,16 +826,67 @@ void test_parse() {
 }
 
 int main() {
-    // test_parse();
-    {
-        std::string input = "((a|bc|d{1,5})(e|fg|h{2,3})){4,6}";
-        std::cout << "parsing " << input << std::endl;
-        auto expr = parse(input);
-        print_expr(*expr, 0);
-        size_t count = 0;
-        auto eqs = gen_eqs(*expr, count);
-        std::cout << "equations" << std::endl;
-        for (auto& eq : eqs) std::cout << eq << std::endl;
+    /*
+    test_parse();
+    std::string input = "((a|bc|d{1,5})(e|fg|h{2,3})){4,6}";
+    std::cout << "parsing " << input << std::endl;
+    auto expr = parse(input);
+    print_expr(*expr, 0);
+    size_t count = 0;
+    auto eqs = gen_eqs(*expr, count);
+    std::cout << "equations" << std::endl;
+    for (auto& eq : eqs) std::cout << eq << std::endl;
+    */
+    std::string regex;
+    std::cout << "Enter a regex: " << std::endl;
+    std::getline(std::cin, regex);
+
+    std::string input;
+    std::cout << "Enter an input: " << std::endl;
+    std::getline(std::cin, input);
+    
+    // Step 1. Parse the input using your parse() function.
+    // (Assume that parse returns a std::unique_ptr<Expr>.)
+    std::unique_ptr<Expr> expr = parse(regex);
+    if (!expr) {
+        std::cerr << "Error: Parsing failed." << std::endl;
+        return 1;
+    }
+    
+    // Step 2. Call gen_eqs() with a counter variable.
+    size_t var_count = 0;
+    // gen_eqs() returns a vector of strings representing equations in your internal format.
+    std::vector<std::string> eqs = gen_eqs(*expr, var_count);
+    if (eqs.empty()) {
+        std::cerr << "Error: gen_eqs produced no equations." << std::endl;
+        return 1;
+    }
+    
+    // Debug: print the generated equations.
+    std::cout << "Generated equations (internal format):" << std::endl;
+    for (const auto &eq : eqs) {
+        std::cout << eq << std::endl;
+    }
+    
+    // Step 3. Convert each generated equation into the format expected by the Python solver.
+    std::vector<std::string> formatted_eqs;
+    for (const auto &eq : eqs) {
+        std::string feq = format_eq(eq, input);
+        formatted_eqs.push_back(feq);
+    }
+    
+    // Debug: print the formatted equations.
+    std::cout << "\nFormatted equations (solver format):" << std::endl;
+    for (const auto &eq : formatted_eqs) {
+        std::cout << eq << std::endl;
+    }
+    
+    // Step 4. For each converted equation, call the Python solver and output its result.
+    std::cout << "\nSolutions from Python solver:" << std::endl;
+    for (const auto &eq : formatted_eqs) {
+        std::cout << "For equation: " << eq << std::endl;
+        std::string solverOutput = solve_eq(eq);
+        std::cout << solverOutput << std::endl;
     }
     return 0;
 }
