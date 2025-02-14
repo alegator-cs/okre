@@ -15,6 +15,14 @@
   
 using namespace std::literals::string_view_literals;
 
+enum class LinkType : size_t {
+    INVALID_ALTERNATION_RHS_EMPTY,
+
+    NONE,
+    CONCATENATION,
+    ALTERNATION,
+};
+
 enum class OpType : size_t {
     INVALID_REPETITION_UNMATCHED,
     INVALID_REPETITION_CHAR,
@@ -22,6 +30,7 @@ enum class OpType : size_t {
     INVALID_REPETITION_N_AND_M_MISSING,
     INVALID_REPETITION_M_LTE_N,
 
+    NONE,
     CONCATENATION,
     ALTERNATION,
     ONE,
@@ -55,23 +64,35 @@ enum class GroupType : size_t {
     BRACKET_NEGATED,
 };
 
+struct Expr;
+
+struct Equation {
+    std::string text;
+    std::vector<Expr*> traversed;
+};
+
 struct Expr {
     GroupType group_type;
     OpType op_type;
+    LinkType link_type;
     std::string_view group;
     std::string_view op;
+    std::string_view link;
     std::vector<std::unique_ptr<Expr>> children;
+    std::vector<Equation> eqs;
     size_t n;
     size_t m;
 
     Expr(GroupType group_type = GroupType::IMPLICIT,
          OpType op_type = OpType::ONE,
+         LinkType link_type = LinkType::NONE,
          std::string_view group = "",
          std::string_view op = "",
+         std::string_view link = "",
          std::vector<std::unique_ptr<Expr>> children = {},
          size_t n = 0,
          size_t m = 0)
-    : group_type(group_type), op_type(op_type), group(group), op(op), children(std::move(children)), n(n), m(m) {}
+    : group_type(group_type), op_type(op_type), link_type(link_type), group(group), op(op), link(link), children(std::move(children)), n(n), m(m) {}
 };
 
 std::string_view scan_number(std::string_view input) {
@@ -128,10 +149,19 @@ OpType check_op(std::string_view input) {
         case '?': return OpType::ZERO_OR_ONE;
         case '*': return OpType::ZERO_OR_MORE;
         case '+': return OpType::ONE_OR_MORE;
-        case '|': return OpType::ALTERNATION;
         case '{': return check_repetition(input);
     }
-    return OpType::CONCATENATION;
+    return OpType::NONE;
+}
+
+LinkType check_link(std::string_view input) {
+    if (input.empty()) return LinkType::NONE;
+    auto c = input[0];
+    if (c == '|') {
+        if (!(input.size() > 1)) return LinkType::INVALID_ALTERNATION_RHS_EMPTY;
+        else return LinkType::ALTERNATION;
+    }
+    return LinkType::CONCATENATION;
 }
 
 bool is_valid_repetition(OpType op_type) {
@@ -142,13 +172,17 @@ bool is_valid_repetition(OpType op_type) {
 }
 
 bool is_valid_op(OpType op_type) {
-    return op_type == OpType::ONE ||
+    return op_type == OpType::NONE ||
+           op_type == OpType::ONE ||
            op_type == OpType::ZERO_OR_ONE ||
            op_type == OpType::ZERO_OR_MORE ||
            op_type == OpType::ONE_OR_MORE ||
-           op_type == OpType::ALTERNATION ||
-           op_type == OpType::CONCATENATION ||
            is_valid_repetition(op_type);
+}
+
+bool is_valid_link(LinkType link_type) {
+    return link_type == LinkType::CONCATENATION ||
+           link_type == LinkType::ALTERNATION;
 }
 
 void set_range(Expr& expr) {
@@ -172,16 +206,6 @@ void set_range(Expr& expr) {
             expr.n = 1;
             expr.m = max;
             break; 
-        }
-        case OpType::ALTERNATION: {
-            expr.n = 0;
-            expr.m = 1;
-            break; 
-        }
-        case OpType::CONCATENATION: {
-            expr.n = 1;
-            expr.m = 1;
-            break;
         }
         case OpType::N: {
             auto n = op;
@@ -218,16 +242,19 @@ std::string_view scan_op(std::string_view input, OpType& op_type) {
     op_type = check_op(input);
     if (op_type == OpType::ZERO_OR_ONE ||
         op_type == OpType::ZERO_OR_MORE ||
-        op_type == OpType::ONE_OR_MORE ||
-        op_type == OpType::ALTERNATION) {
+        op_type == OpType::ONE_OR_MORE) {
         return input.substr(0, 1);
     }
-    else if (op_type != OpType::CONCATENATION) {
-        if (is_valid_repetition(op_type)) {
-            return input.substr(0, input.find('}') + 1);
-        }
+    else if (is_valid_repetition(op_type)) {
+        return input.substr(0, input.find('}') + 1);
     }
     return "";
+}
+
+std::string_view scan_link(std::string_view input, LinkType& link_type) {
+    link_type = check_link(input);
+    if (link_type == LinkType::ALTERNATION) return input.substr(0, 1);
+    else return "";
 }
 
 bool is_valid_group(GroupType group_type) {
@@ -305,33 +332,36 @@ char char_to_escaped_char(char c) {
 
 std::string_view scan_bracket_char(std::string_view input, GroupType& type) {
     if (input.empty()) return "";
+
     char c = input[0];
-    size_t char_size = 1;
+    bool escaped_char = (c == '\\');
+    if (!escaped_char) return input.substr(0, 1);
+
     size_t escape_size = 2;
-    size_t hex_size = 2;
     bool escape_fits = (input.size()) >= (escape_size);
-    if (escape_fits) {
-        auto maybe_escape_hex = input.substr(0, escape_size);
-        if (maybe_escape_hex == "\\x") {
-            size_t min_size_for_hex = 4;
-            bool hex_fits = (input.size()) >= (min_size_for_hex);
-            auto maybe_hex = input.substr(escape_size, hex_size);
-            bool hex_valid = (hex_fits) && (std::isxdigit(maybe_hex[0])) && (std::isxdigit(maybe_hex[1]));
-            if (!hex_valid) {
-                type = GroupType::INVALID_BRACKET_HEX;
-                return "";
-            }
-            return input.substr(0, escape_size + hex_size);
-        }
-        else if (c == '\\') {
-            return input.substr(0, escape_size);
-        }
-    }
-    else if (c == '\\') {
+    auto escape = (escape_fits) ? (input.substr(0, escape_size)) : ("");
+    if (escape_fits && escape != "\\x") return input.substr(0, 2);
+    if (!escape_fits) {
         type = GroupType::INVALID_BRACKET_ESCAPE;
         return "";
     }
-    return input.substr(0, char_size);
+
+    size_t skip_size = 2;
+    size_t hex_size = 2;
+    bool hex_fits = (input.size()) >= (skip_size + hex_size);
+    if (hex_fits) {
+        auto hex = input.substr(skip_size, hex_size);
+        bool hex_valid = std::all_of(hex.begin(), hex.end(), ::isxdigit);
+        if (!hex_valid) {
+            type = GroupType::INVALID_BRACKET_HEX;
+            return "";
+        }
+        return input.substr(0, skip_size + hex_size);
+    }
+    else {
+        type = GroupType::INVALID_BRACKET_HEX;
+        return "";
+    }
 }
 
 /*
@@ -398,28 +428,28 @@ std::string_view scan_bracket(std::string_view input, GroupType& type) {
     }
     else end_it++;
     size_t end_pos = std::distance(input.begin(), end_it);
-    auto unwrapped = input.substr(1 + (input[1] == '^'), end_pos - 1);
+    auto content = input.substr(1 + (input[1] == '^'), end_pos - 1);
     size_t i = 0;
-    size_t max = unwrapped.size();
+    size_t max = content.size();
     while (i < max) {
-        char c = unwrapped[i];
+        char c = content[i];
         if (c == '[') {
-            auto inner = scan_bracket_inner(unwrapped, type);
+            auto inner = scan_bracket_inner(content, type);
             if (inner.empty()) return "";
             else i += inner.size();
         }
         else {
-            auto sub1 = unwrapped.substr(i);
+            auto sub1 = content.substr(i);
             auto sv_c1 = scan_bracket_char(sub1, type);
             char c1 = eval_bracket_char(sv_c1);
             if (c1 == '\0') return "";
             size_t dash_size = 1;
             size_t maybe_dash_pos = (i + sv_c1.size());
             bool dash_fits = (maybe_dash_pos) < (max);
-            char maybe_dash = (dash_fits) ? (unwrapped[maybe_dash_pos]) : ('\0');
+            char maybe_dash = (dash_fits) ? (content[maybe_dash_pos]) : ('\0');
             if (maybe_dash == '-') {
                 size_t after_dash_pos = (i + sv_c1.size() + dash_size);
-                auto sub2 = unwrapped.substr(after_dash_pos);
+                auto sub2 = content.substr(after_dash_pos);
                 auto sv_c2 = scan_bracket_char(sub2, type);
                 char c2 = eval_bracket_char(sv_c2);
                 if (c2 == '\0') return "";
@@ -435,13 +465,13 @@ std::string_view scan_bracket(std::string_view input, GroupType& type) {
     return input.substr(0, end_pos + 1);
 }
 
-// "abc+" -> "ab"
-// "abc(" -> "abc"
-// "c+" -> ""
+// "ab+" -> "a"
+// "ab(" -> "ab"
+// "c+" -> "c"
 // "c(" -> "c"
 std::string_view scan_group_implicit(std::string_view input) {
     constexpr std::string_view end = "(){|?*+";
-    constexpr std::string_view split = "?*+";
+    constexpr std::string_view split = "?*+{";
 
     size_t pos_find = input.find_first_of(end);
     if (pos_find == std::string_view::npos) return input;
@@ -477,9 +507,15 @@ bool is_wrapped(GroupType type) {
            type == GroupType::NONCAPTURE;
 }
 
+bool is_bracketed(GroupType type) {
+    return type == GroupType::BRACKET ||
+           type == GroupType::BRACKET_NEGATED;
+}
+
 std::string_view scan_group(std::string_view input, GroupType& type) {
     type = check_group(input);
-    if (type == GroupType::BRACKET || type == GroupType::BRACKET_NEGATED) return scan_bracket(input, type);
+    bool bracketed = is_bracketed(type);
+    if (bracketed) return scan_bracket(input, type);
     bool wrapped = is_wrapped(type);
     if (wrapped) return scan_group_explicit(input, type);
     else return scan_group_implicit(input);
@@ -495,13 +531,14 @@ std::unique_ptr<Expr> parse(std::string_view input) {
     if (input.empty()) return nullptr;
 
     // Parsing begins here, nests down recursively
-    auto root = std::make_unique<Expr>(GroupType::IMPLICIT, OpType::ONE, input, "", std::vector<std::unique_ptr<Expr>>{}, 1, 1);
+    auto root = std::make_unique<Expr>(GroupType::IMPLICIT, OpType::ONE, LinkType::NONE, input, "", "", std::vector<std::unique_ptr<Expr>>{}, 1, 1);
 
     GroupType group_type;
     auto scan = scan_group(input, group_type);
+    bool wrapped = is_wrapped(group_type);
 
     // Handle final nesting
-    if (scan.size() == input.size()) {
+    if ((wrapped ? unwrap_group(scan) : scan).size() == input.size()) {
         root->group_type = group_type;
         return std::move(root);
     }
@@ -509,7 +546,6 @@ std::unique_ptr<Expr> parse(std::string_view input) {
     // TODO: Handle group parse errors
     if (!is_valid_group(group_type)) {}
 
-    bool wrapped = is_wrapped(group_type);
     auto rest = input.substr(scan.size());
 
     // Handle increasing nesting and left-to-right group traversal
@@ -523,13 +559,15 @@ std::unique_ptr<Expr> parse(std::string_view input) {
         lhs->group = scan;
         lhs->group_type = group_type;
         lhs->op = scan_op(rest, lhs->op_type);
+        lhs->link = scan_link(rest.substr(lhs->op.size()), lhs->link_type);
         set_range(*lhs);
 
-        // TODO: Handle op parse errors
+        // TODO: Handle op and link parse errors
         if (!is_valid_op(lhs->op_type)) {}
+        if (!is_valid_link(lhs->link_type)) {}
 
-        // Consume the operation (concatenation removes nothing)
-        rest.remove_prefix(lhs->op.size());
+        // Consume the operation and link (concatenation removes nothing)
+        rest.remove_prefix(lhs->op.size() + lhs->link.size());
 
         // Add the group as a child
         root->children.push_back(std::move(lhs));
@@ -550,12 +588,9 @@ bool is_number(const std::string& s) {
     return !s.empty() && std::all_of(s.begin(), s.end(), ::isdigit);
 }
 
-void merge_eqs(std::vector<std::string>& lhs, const std::vector<std::string>& rhs) {
-    std::unordered_set<std::string> unique_eqs(lhs.begin(), lhs.end());
+void merge_eqs(std::vector<Equation>& lhs, const std::vector<Equation>& rhs) {
     for (const auto& eq : rhs) {
-        if (unique_eqs.insert(eq).second) {
-            lhs.push_back(eq);
-        }
+        lhs.push_back(eq);
     }
 }
 
@@ -567,17 +602,16 @@ std::string_view scan_const(std::string_view input) {
            ("");
 }
 
-void cart_prod_pair_sum_eqs(std::vector<std::string>& lhs, const std::vector<std::string>& rhs) {
-    std::unordered_set<std::string> unique_sums;
-    std::vector<std::string> new_lhs;
-    for (std::string left : lhs) {
-        auto left_const = scan_const(left);
-        auto left_expr = left.substr(left_const.size());
+void cart_prod_pair_sum_eqs(std::vector<Equation>& lhs, const std::vector<Equation>& rhs) {
+    std::vector<Equation> new_lhs;
+    for (auto& left : lhs) {
+        auto left_const = scan_const(left.text);
+        auto left_expr = left.text.substr(left_const.size());
         size_t left_val = 0;
         std::from_chars(left_const.data(), left_const.data() + left_const.size(), left_val);
-        for (std::string right : rhs) {
-            auto right_const = scan_const(right);
-            auto right_expr = right.substr(right_const.size());
+        for (auto& right : rhs) {
+            auto right_const = scan_const(right.text);
+            auto right_expr = right.text.substr(right_const.size());
             size_t right_val = 0;
             std::from_chars(right_const.data(), right_const.data() + right_const.size(), right_val);
             int combined_const = left_val + right_val;
@@ -588,97 +622,84 @@ void cart_prod_pair_sum_eqs(std::vector<std::string>& lhs, const std::vector<std
                                          ("+") :
                                          ("")) +
                                      std::string(left_expr) +
-                                     ((!right_expr.empty() && (right[0] != '+')) ?
+                                     ((!right_expr.empty() && (right.text[0] != '+')) ?
                                          ("+") :
                                          ("")) +
                                      std::string(right_expr);
-            if (!final_expr.empty() && unique_sums.insert(final_expr).second) {
-                new_lhs.push_back(std::move(final_expr));
+            std::vector<Expr*> traversed = left.traversed;
+            for (auto* t : right.traversed) {
+                traversed.push_back(t);
             }
+            new_lhs.emplace_back(std::move(final_expr), std::move(traversed));
         }
     }
     lhs = new_lhs;
 }
 
-void scalar_mult_eqs(std::vector<std::string>& eqs, const std::string& c) {
+void scalar_mult_eqs(std::vector<Equation>& eqs, std::string& c) {
     for (auto& eq : eqs) {
         size_t last_pos = 0;
         size_t pos = 0;
         std::string_view term;
-        while ((pos = eq.find('+', pos)) != std::string::npos) {
-            term = eq.substr(last_pos, pos);
+        while ((pos = eq.text.find('+', pos)) != std::string::npos) {
+            term = eq.text.substr(last_pos, pos);
             if (term[0] == '{') {
-                eq.insert(last_pos, "1");
+                eq.text.insert(last_pos, "1");
                 pos++;
             }
-            eq.insert(pos, c);
+            eq.text.insert(pos, c);
             pos += c.length() + 1;
             last_pos = pos;
         }
-        term = eq.substr(last_pos);
+        term = eq.text.substr(last_pos);
         if (term[0] == '{') {
-            eq.insert(last_pos, "1");
+            eq.text.insert(last_pos, "1");
             pos++;
         }
-        eq += c;
+        eq.text += c;
     }
 }
 
-std::vector<std::string> gen_eqs(Expr& expr, size_t& var_count) {
+std::string n_m_to_var(size_t n, size_t m, size_t var_count) {
+    auto nt = std::to_string(n);
+    auto mt = std::to_string(m);
+    auto count = std::to_string(var_count);
+    return "{x" + count + ":" + nt + "," + mt + "}";
+}
+
+void gen_eqs(Expr& expr, size_t& var_count) {
+    Expr* first = nullptr;
+    LinkType link_type = LinkType::NONE;
     if (expr.children.empty()) {
-        if (expr.op_type == OpType::CONCATENATION ||
-            expr.op_type == OpType::ONE ||
-            expr.op_type == OpType::ALTERNATION) {
-            return std::vector<std::string>{std::to_string(expr.group.size())}; 
-        }
-        else {
-            auto n = std::to_string(expr.n);
-            auto m = std::to_string(expr.m);
-            auto count = std::to_string(var_count++);
-            auto var = "{x" + count + ":" + n + "," + m + "}";
-            return std::vector<std::string>{var}; 
-        }
+        auto number = std::to_string(expr.group.size());
+        expr.eqs.emplace_back(number, std::vector<Expr*>{&expr});
     }
-    Expr& first = *expr.children[0];
-    std::vector<std::string> eqs = gen_eqs(first, var_count);
-    OpType op_type = first.op_type;
+    else {
+        first = expr.children[0].get();
+        gen_eqs(*first, var_count);
+        merge_eqs(expr.eqs, first->eqs);
+        link_type = first->link_type;
+    }
     size_t max = expr.children.size();
     for (size_t i = 1; i < max; i++) {
         Expr& ch = *expr.children[i];
-        auto ch_eqs = gen_eqs(ch, var_count);
-        switch (op_type) {
-            case OpType::ALTERNATION: {
-                merge_eqs(eqs, ch_eqs); break;
+        gen_eqs(ch, var_count);
+        switch (link_type) {
+            case LinkType::ALTERNATION: {
+                merge_eqs(expr.eqs, ch.eqs); break;
             }
-            case OpType::CONCATENATION: {
-                cart_prod_pair_sum_eqs(eqs, ch_eqs); break;
+            case LinkType::CONCATENATION: {
+                cart_prod_pair_sum_eqs(expr.eqs, ch.eqs); break;
             }
-            case OpType::ONE: {
-                cart_prod_pair_sum_eqs(eqs, ch_eqs); break;
-            }
-            default: {
-                auto n = std::to_string(expr.n);
-                auto m = std::to_string(expr.m);
-                auto count = std::to_string(var_count++);
-                auto var = "{x" + count + ":" + n + "," + m + "}";
-                scalar_mult_eqs(eqs, var);
-                break;
+            case LinkType::NONE: {
+                cart_prod_pair_sum_eqs(expr.eqs, ch.eqs); break;
             }
         }
-        op_type = ch.op_type;
+        link_type = ch.link_type;
     }
-    if (expr.op_type == OpType::CONCATENATION ||
-        expr.op_type == OpType::ONE || 
-        expr.op_type == OpType::ALTERNATION) {
-        return eqs;
-    }
-    else {
-        auto n = std::to_string(expr.n);
-        auto m = std::to_string(expr.m);
-        auto count = std::to_string(var_count++);
-        auto var = "{x" + count + ":" + n + "," + m + "}";
-        scalar_mult_eqs(eqs, var);
-        return eqs;
+    if (expr.op_type != OpType::NONE && expr.op_type != OpType::ONE) {
+        auto var = n_m_to_var(expr.n, expr.m, var_count++);
+        scalar_mult_eqs(expr.eqs, var);
     }
 }
 
@@ -690,25 +711,25 @@ std::vector<std::string> gen_eqs(Expr& expr, size_t& var_count) {
 //    "1*x0*x1+2*x1*x2=9"
 // That is, remove each brace-enclosed bound, leaving only the variable name.
 // ------------------------------------------------------------------
-std::string format_eq(const std::string &eq, std::string& input) {
+std::string format_eq(const Equation& eq, std::string& input) {
     std::string result;
-    result.reserve(eq.size());
+    result.reserve(eq.text.size());
     // We scan the string character by character.
-    for (size_t i = 0; i < eq.size(); ++i) {
-        char c = eq[i];
+    for (size_t i = 0; i < eq.text.size(); ++i) {
+        char c = eq.text[i];
         if (c == '{') {
             // We assume the format is "{<var>:<n>,<m>}"
             // Find the colon and then the closing brace.
-            size_t colonPos = eq.find(':', i);
-            size_t closePos = eq.find('}', i);
+            size_t colonPos = eq.text.find(':', i);
+            size_t closePos = eq.text.find('}', i);
             if (colonPos == std::string::npos || closePos == std::string::npos) {
                 // If something is wrong, copy the rest and break.
-                result.append(eq.substr(i));
+                result.append(eq.text.substr(i));
                 break;
             }
             // Append the substring from after '{' up to the colon.
             result.append("*");
-            result.append(eq.substr(i+1, colonPos - i - 1));
+            result.append(eq.text.substr(i + 1, colonPos - i - 1));
             // Skip ahead past the closing brace.
             i = closePos;
         } else {
@@ -745,12 +766,20 @@ std::string solve_eq(const std::string &equation) {
 // Function to print parsed expressions for debugging
 void print_expr(const Expr& expr, int indent = 0) {
     std::string padding(indent * 2, ' ');
-    std::cout << padding << "Expr: Group = " << static_cast<size_t>(expr.group_type)
-              << ", Op = " << static_cast<size_t>(expr.op_type)
+    std::cout << padding
+              << "Expr:" << std::endl
+              << ", Group = \"" << expr.group
+              << "\", Op = \"" << expr.op
+              << "\", Link = \"" << expr.link
+              << "\", Op String = \"" << expr.op << "\""
               << ", n = " << expr.n
               << ", m = " << expr.m
-              << ", Group String = \"" << expr.group
-              << "\", Op String = \"" << expr.op << "\"\n";
+              << ", m = " << expr.m;
+
+    for (auto& eq : expr.eqs) {
+        std::cout << padding
+                  << eq.text << std::endl;
+    }
 
     for (const auto& child : expr.children) {
         print_expr(*child, indent + 1);
@@ -856,21 +885,23 @@ int main() {
     // Step 2. Call gen_eqs() with a counter variable.
     size_t var_count = 0;
     // gen_eqs() returns a vector of strings representing equations in your internal format.
-    std::vector<std::string> eqs = gen_eqs(*expr, var_count);
-    if (eqs.empty()) {
+    gen_eqs(*expr, var_count);
+    if (expr->eqs.empty()) {
         std::cerr << "Error: gen_eqs produced no equations." << std::endl;
         return 1;
     }
+
+    print_expr(*expr);
     
     // Debug: print the generated equations.
     std::cout << "Generated equations (internal format):" << std::endl;
-    for (const auto &eq : eqs) {
-        std::cout << eq << std::endl;
+    for (const auto &eq : expr->eqs) {
+        std::cout << eq.text << std::endl;
     }
     
     // Step 3. Convert each generated equation into the format expected by the Python solver.
     std::vector<std::string> formatted_eqs;
-    for (const auto &eq : eqs) {
+    for (const auto &eq : expr->eqs) {
         std::string feq = format_eq(eq, input);
         formatted_eqs.push_back(feq);
     }
