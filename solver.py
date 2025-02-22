@@ -4,30 +4,50 @@ import re
 import math
 import itertools
 import numpy as np
-from sympy import symbols, diophantine, Eq, sympify, lambdify
+from sympy import symbols, diophantine, Eq, lambdify
 from scipy.optimize import linprog
+
+#############################################
+# Helper: parse an x-variable specification #
+#############################################
+def parse_xvar_spec(spec):
+    """
+    Parse an x-variable specification string.
+
+    Valid formats:
+      "x0"         -> (0, sys.maxsize)
+      "x0:3"       -> (3, 3)
+      "x0:3,"      -> (3, sys.maxsize)
+      "x0:,5"      -> (0, 5)
+      "x0:3,5"     -> (3, 5)
+    """
+    global_max = sys.maxsize
+    if ':' not in spec:
+        # No colon => no bounds => (0, max)
+        return (0, global_max)
+    # Split on colon
+    parts = spec.split(':', 1)
+    bounds_spec = parts[1]
+    if ',' not in bounds_spec:
+        # Single integer => exact
+        try:
+            val = int(bounds_spec)
+            return (val, val)
+        except:
+            return (0, global_max)
+    else:
+        lower_str, upper_str = bounds_spec.split(',', 1)
+        lower = int(lower_str) if lower_str else 0
+        upper = int(upper_str) if upper_str else global_max
+        return (lower, upper)
 
 #############################################
 # Preprocessing: parse the factored equation #
 #############################################
-
 def preprocess_equation(eq_str):
     """
-    Given an input string such as "5*x0*x1+2*x1*x2+3=9",
-    this function splits the left-hand side into terms, extracts the coefficient
-    and the ordered list of x-variable names for each term, and assigns a new
-    y-variable name for each nonconstant term.
-    
-    Constant-only terms (with no x-variable) are not converted;
-    instead, their numeric value is subtracted from the rhs.
-    
-    Returns:
-      - new_eq_str: a string like "5*y0+2*y1=<adjusted_rhs>"
-      - term_data: a list of dicts, one per nonconstant term, each with keys:
-            'y'    : the new variable name (e.g. "y0")
-            'coeff': the numeric coefficient (as an int)
-            'xvars': a list of the x-variable names (e.g. ["x0", "x1"])
-      - rhs: the adjusted right-hand side as an integer.
+    E.g. "5*x0*x1+2*x1:x2+3=9" -> parse LHS into terms, subtract constant from RHS,
+    record nonconstant terms in term_data with 'y', 'coeff', 'xvars'.
     """
     eq_str = eq_str.replace(" ", "")
     parts = eq_str.split("=")
@@ -45,10 +65,11 @@ def preprocess_equation(eq_str):
     constant_sum = 0
     for term in term_strs:
         factors = term.split('*')
-        # If the term is a constant (only one factor and numeric), add it.
         if len(factors) == 1 and re.fullmatch(r'\d+', factors[0]):
+            # pure constant
             constant_sum += int(factors[0])
         else:
+            # maybe leading numeric coefficient
             if re.fullmatch(r'\d+', factors[0]):
                 coeff = int(factors[0])
                 xvars = factors[1:]
@@ -56,6 +77,7 @@ def preprocess_equation(eq_str):
                 coeff = 1
                 xvars = factors
             if not xvars:
+                # no xvars => pure constant
                 constant_sum += coeff
             else:
                 y_name = f"y{len(term_data)}"
@@ -66,9 +88,8 @@ def preprocess_equation(eq_str):
     return new_eq_str, term_data, new_rhs
 
 #############################################
-# Helper to build a "human-friendly" constraint string
+# Helper: build a "human-friendly" constraint
 #############################################
-
 def constraint_to_string(a_list, c_val, free_params, bound_val, is_lower=True):
     sign = ">=" if is_lower else "<="
     parts = []
@@ -98,23 +119,29 @@ def constraint_to_string(a_list, c_val, free_params, bound_val, is_lower=True):
 #############################################
 # Solve the linear equation in terms of free parameters
 #############################################
-
 def solve_linear_equation(new_eq_str, term_data, rhs):
+    """
+    We build an equation sum(coeff_i * y_i) = rhs, call diophantine,
+    parse the parametric solution, and then set trivial bounds for each y_i
+    based on xvar specs. We solve param bounds with linprog, then enumerate.
+    """
+    # Create sympy symbols
+    from sympy import Eq, diophantine, symbols, lambdify
     y_vars = [symbols(term['y'], integer=True) for term in term_data]
-    eq_sym = Eq(sum(t['coeff']*v for t,v in zip(term_data,y_vars)), rhs)
+    eq_sym = Eq(sum(t['coeff'] * v for t,v in zip(term_data, y_vars)), rhs)
     
     sol_set = diophantine(eq_sym)
     if not sol_set:
         return []
     sol = next(iter(sol_set))
-    if not isinstance(sol, (tuple,list)):
+    if not isinstance(sol, (tuple, list)):
         sol = (sol,)
     
     print("General solution for y variables:")
     for i, expr in enumerate(sol):
         print(f"  {y_vars[i]} = {expr}")
     
-    # Identify free params
+    # Identify free parameters
     free_params = set()
     for expr in sol:
         free_params |= expr.free_symbols
@@ -124,59 +151,86 @@ def solve_linear_equation(new_eq_str, term_data, rhs):
     # Build lambdas
     f_funcs = [lambdify(free_params, expr, "math") for expr in sol]
     
-    # trivial bounds
+    # For each y_i, compute trivial bounds
+    # from xvar specs: product of (lb..ub)
+    # then intersect with [0..floor(rhs/coeff)].
     trivial_bounds = []
     for term in term_data:
-        trivial_bounds.append((0, math.floor(rhs / term['coeff'])))
+        coeff = term['coeff']
+        xvars = term['xvars']
+        prod_lower = 1
+        prod_upper = 1
+        debraced_vars = []
+        for xspec in xvars:
+            if xspec.startswith("{") and xspec.endswith("}"):
+                xspec = xspec[1:-1]  # remove outer braces
+            debraced_vars.append(xspec)
+        for xspec in debraced_vars:
+            lb, ub = parse_xvar_spec(xspec)
+            prod_lower *= lb
+            prod_upper *= ub
+        # y_i's lower bound = max(0, coeff * prod_lower)
+        # y_i's upper bound = min(floor(rhs/coeff), coeff * prod_upper)
+        low_candidate = coeff * prod_lower
+        high_candidate = coeff * prod_upper
+        global_upper = math.floor(rhs / coeff)
+        L_i = max(0, low_candidate)
+        U_i = min(global_upper, high_candidate)
+        trivial_bounds.append((L_i, U_i))
     
-    # Build constraints
-    coeff_constraints = []
+    print("\nConstraints for each y_i (using xvar specs):")
+    # Build the coefficient list
+    from sympy import Add
+    sol_coeffs = []
     for expr in sol:
         d = expr.as_coefficients_dict()
-        c_val = d.get(1, 0)
-        a_list = [float(d.get(p, 0)) for p in free_params]
-        coeff_constraints.append((a_list, float(c_val)))
+        c_val = float(d.get(1, 0))
+        a_list = []
+        for p in free_params:
+            a_list.append(float(d.get(p, 0)))
+        sol_coeffs.append((a_list, c_val))
     
-    print("\nConstraints for each y_i:")
-    for i, (a_list, c_val) in enumerate(coeff_constraints):
+    for i, (a_list, c_val) in enumerate(sol_coeffs):
         L_i, U_i = trivial_bounds[i]
-        cstr_lower = constraint_to_string(a_list, c_val, free_params, L_i, True)
-        cstr_upper = constraint_to_string(a_list, c_val, free_params, U_i, False)
-        print(f"  y{i} >= {L_i} => {cstr_lower}")
-        print(f"  y{i} <= {U_i} => {cstr_upper}")
+        low_str = constraint_to_string(a_list, c_val, free_params, L_i, True)
+        up_str = constraint_to_string(a_list, c_val, free_params, U_i, False)
+        print(f"  y{i} => {term_data[i]['xvars']} : {term_data[i]['coeff']}")
+        print(f"     Lower: {low_str}")
+        print(f"     Upper: {up_str}")
     
+    # Build A_ub, b_ub
     A_ub = []
     b_ub = []
-    for i, (a, c_val) in enumerate(coeff_constraints):
+    for i, (a_list, c_val) in enumerate(sol_coeffs):
         L_i, U_i = trivial_bounds[i]
-        # lower: y_i >= L_i => a·t + c >= L => -a·t <= c - L
-        A_ub.append([-x for x in a])
+        # y_i >= L_i => -a·t <= c_val - L_i
+        A_ub.append([-a for a in a_list])
         b_ub.append(c_val - L_i)
-        # upper: y_i <= U_i => a·t + c <= U => a·t <= U - c
-        A_ub.append(a)
+        # y_i <= U_i => a·t <= U_i - c_val
+        A_ub.append(a_list)
         b_ub.append(U_i - c_val)
     
-    A_ub = np.array(A_ub)
-    b_ub = np.array(b_ub)
+    A_ub = np.array(A_ub, dtype=float)
+    b_ub = np.array(b_ub, dtype=float)
     
     # Solve LP for each free param with no fallback bounding
-    free_bounds = [(None, None)] * len(free_params)
+    free_bounds_lp = [(None, None)] * len(free_params)
     lower_free = []
     upper_free = []
     
     for j in range(len(free_params)):
         c_obj = [0]*len(free_params)
         c_obj[j] = 1
-        res_min = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=free_bounds, method="highs")
-        if not res_min.success or res_min.status in (3,4):
-            print(f"No feasible/min bound for {free_params[j]} => region unbounded or infeasible.")
+        res_min = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=free_bounds_lp, method="highs")
+        if not res_min.success:
+            print(f"No feasible minimum bound for {free_params[j]}.")
             return []
         min_val = math.ceil(res_min.fun)
         
         c_obj[j] = -1
-        res_max = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=free_bounds, method="highs")
-        if not res_max.success or res_max.status in (3,4):
-            print(f"No feasible/max bound for {free_params[j]} => region unbounded or infeasible.")
+        res_max = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=free_bounds_lp, method="highs")
+        if not res_max.success:
+            print(f"No feasible maximum bound for {free_params[j]}.")
             return []
         max_val = math.floor(-res_max.fun)
         
@@ -187,12 +241,12 @@ def solve_linear_equation(new_eq_str, term_data, rhs):
         lower_free.append(min_val)
         upper_free.append(max_val)
     
-    print("\nBounds for free parameters (inferred from constraints):")
+    print("\nFinal bounds for free parameters:")
     for p, lo, hi in zip(free_params, lower_free, upper_free):
         print(f"  {p} in [{lo}, {hi}]")
     
-    # Enumerate
-    free_ranges = [range(lo, hi+1) for lo, hi in zip(lower_free,upper_free)]
+    # Enumerate integer values
+    free_ranges = [range(lo, hi+1) for lo, hi in zip(lower_free, upper_free)]
     candidate_y_solutions = []
     for vals in itertools.product(*free_ranges):
         candidate = tuple(int(round(f(*vals))) for f in f_funcs)
@@ -208,9 +262,8 @@ def solve_linear_equation(new_eq_str, term_data, rhs):
     return candidate_y_solutions
 
 #############################################
-# Factorization, filtering, etc.
+# factorize_n, filter_by_equivalences, etc.
 #############################################
-
 def factorize_n(n, r):
     if r == 1:
         return [(n,)]
@@ -244,58 +297,46 @@ def postprocess_solution(y_solution, term_data):
     for i, y_val in enumerate(y_solution):
         r = len(term_data[i]['xvars'])
         if y_val <= 0:
-            fac = (0,)*r
+            fac = (0,) * r
             per_term_factorizations.append([fac])
         else:
             facs = factorize_n(y_val, r)
             per_term_factorizations.append(facs)
-    return filter_by_equivalences(per_term_factorizations, term_data)
+    valid = filter_by_equivalences(per_term_factorizations, term_data)
+    return valid
 
 def solutions_as_dicts(overall_factorizations, term_data):
+    """
+    Convert each combined factorization (one factorization tuple per nonconstant term)
+    into a dictionary mapping just the base x-variable name (e.g. 'x0') to its integer value.
+
+    For example, if xvar is 'x0:1,' or 'x0:2,5', we strip off everything after the colon
+    and store only 'x0' as the dictionary key.
+    """
     sol_dicts = []
     for combo in overall_factorizations:
         d = {}
         valid = True
         for i, factorization in enumerate(combo):
             for j, xvar in enumerate(term_data[i]['xvars']):
-                if xvar in d:
-                    if d[xvar] != factorization[j]:
+                # Extract the base variable name (e.g. 'x0') by ignoring any suffix after ':'
+                colon_pos = xvar.find(':')
+                if xvar.startswith("{") and xvar.endswith("}"):
+                    xvar = xvar[1:-1]  # remove the outer braces&
+                base_var = xvar[:colon_pos - 1] if colon_pos != -1 else xvar
+
+                if base_var in d:
+                    # If we've already assigned a value to this base_var, check consistency
+                    if d[base_var] != factorization[j]:
                         valid = False
                         break
                 else:
-                    d[xvar] = factorization[j]
+                    d[base_var] = factorization[j]
             if not valid:
                 break
         if valid:
             sol_dicts.append(d)
     return sol_dicts
-
-#############################################
-# Parse the original eq for verification
-#############################################
-
-def parse_original_equation(eq_str):
-    """
-    Parse the original eq_str (like '4*x0+1*x1*x2=20') into a Sympy Eq object
-    using the x-variables found. We'll use the same approach as a minimal parse.
-    """
-    from sympy import symbols, Eq, sympify
-    eq_str_nospace = eq_str.replace(" ", "")
-    parts = eq_str_nospace.split("=")
-    if len(parts) != 2:
-        raise ValueError("Original eq must have '='.")
-    lhs_str, rhs_str = parts
-    # find x-variables
-    var_names = sorted(set(re.findall(r'x\d+', lhs_str)), key=lambda s: int(s[1:]))
-    var_dict = {name: symbols(name, integer=True) for name in var_names}
-    lhs_expr = sympify(lhs_str, locals=var_dict)
-    rhs_expr = sympify(rhs_str, locals=var_dict)
-    eq_orig = Eq(lhs_expr, rhs_expr)
-    return eq_orig, var_dict
-
-#############################################
-# Main driver
-#############################################
 
 def main():
     if len(sys.argv) > 1:
@@ -330,34 +371,8 @@ def main():
     
     sol_dicts = solutions_as_dicts(overall_factorizations, term_data)
     print("\nFinal candidate solutions (dict mapping x-variable to value):")
-    
-    # Now parse the *original* eq_str for verification:
-    try:
-        eq_orig, var_dict = parse_original_equation(eq_str)
-    except ValueError:
-        eq_orig = None
-        var_dict = {}
-        print("(Couldn't parse original eq for verification.)")
-    
     for d in sol_dicts:
-        # Print the dictionary
-        print(d, end='')
-        # If we have eq_orig, let's verify
-        if eq_orig is not None and var_dict:
-            # Build a subs map from x0->..., x1->... in 'd' 
-            # but eq_orig might have a subset of those variables
-            subs_map = {}
-            for k,v in d.items():
-                if k in var_dict:
-                    subs_map[var_dict[k]] = v
-            lhs_val = eq_orig.lhs.subs(subs_map)
-            rhs_val = eq_orig.rhs.subs(subs_map)
-            if lhs_val == rhs_val:
-                print(" (success)")
-            else:
-                print(" (error)")
-        else:
-            print("")
+        print(d)
 
 if __name__ == "__main__":
     main()

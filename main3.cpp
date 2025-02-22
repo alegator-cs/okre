@@ -80,8 +80,11 @@ struct Expr {
     std::string_view link;
     std::vector<std::unique_ptr<Expr>> children;
     std::vector<Equation> eqs;
+    std::string var;
     size_t n;
     size_t m;
+    size_t start;
+    size_t size;
 
     Expr(GroupType group_type = GroupType::IMPLICIT,
          OpType op_type = OpType::ONE,
@@ -90,9 +93,13 @@ struct Expr {
          std::string_view op = "",
          std::string_view link = "",
          std::vector<std::unique_ptr<Expr>> children = {},
+         std::vector<Equation> eqs = {},
+         std::string var = "",
          size_t n = 0,
-         size_t m = 0)
-    : group_type(group_type), op_type(op_type), link_type(link_type), group(group), op(op), link(link), children(std::move(children)), n(n), m(m) {}
+         size_t m = 0,
+         size_t start = 0,
+         size_t size = 0)
+    : group_type(group_type), op_type(op_type), link_type(link_type), group(group), op(op), link(link), children(std::move(children)), eqs(eqs), var(var), n(n), m(m), start(start), size(size) {}
 };
 
 std::string_view scan_number(std::string_view input) {
@@ -531,7 +538,7 @@ std::unique_ptr<Expr> parse(std::string_view input) {
     if (input.empty()) return nullptr;
 
     // Parsing begins here, nests down recursively
-    auto root = std::make_unique<Expr>(GroupType::IMPLICIT, OpType::ONE, LinkType::NONE, input, "", "", std::vector<std::unique_ptr<Expr>>{}, 1, 1);
+    auto root = std::make_unique<Expr>(GroupType::IMPLICIT, OpType::ONE, LinkType::NONE, input, "", "", std::vector<std::unique_ptr<Expr>>{}, std::vector<Equation>{}, "", 1, 1, 0, 0);
 
     GroupType group_type;
     auto scan = scan_group(input, group_type);
@@ -643,27 +650,27 @@ void scalar_mult_eqs(std::vector<Equation>& eqs, std::string& c) {
         std::string_view term;
         while ((pos = eq.text.find('+', pos)) != std::string::npos) {
             term = eq.text.substr(last_pos, pos);
-            if (term[0] == '{') {
-                eq.text.insert(last_pos, "1");
-                pos++;
-            }
-            eq.text.insert(pos, c);
-            pos += c.length() + 1;
+            eq.text.insert(pos, "*" + c);
+            pos += c.length() + 2;
             last_pos = pos;
         }
         term = eq.text.substr(last_pos);
-        if (term[0] == '{') {
-            eq.text.insert(last_pos, "1");
-            pos++;
-        }
-        eq.text += c;
+        eq.text += "*" + c;
     }
 }
 
 std::string n_m_to_var(size_t n, size_t m, size_t var_count) {
-    auto nt = std::to_string(n);
-    auto mt = std::to_string(m);
+    size_t min = 0;
+    size_t max = std::numeric_limits<decltype(m)>::max();
+    std::string nt = (n > min) ? (std::to_string(n)) : ("");
+    std::string mt = (m < max) ? (std::to_string(m)) : ("");
     auto count = std::to_string(var_count);
+    if (n == min && m == max) {
+        return "{x" + count + "}";
+    }
+    if (nt == mt) {
+        return "{x" + count + ":" + nt + "}";
+    }
     return "{x" + count + ":" + nt + "," + mt + "}";
 }
 
@@ -672,7 +679,7 @@ void gen_eqs(Expr& expr, size_t& var_count) {
     LinkType link_type = LinkType::NONE;
     if (expr.children.empty()) {
         auto number = std::to_string(expr.group.size());
-        expr.eqs.emplace_back(number, std::vector<Expr*>{&expr});
+        expr.eqs.emplace_back(number, std::vector<Expr*>{});
     }
     else {
         first = expr.children[0].get();
@@ -698,46 +705,12 @@ void gen_eqs(Expr& expr, size_t& var_count) {
         link_type = ch.link_type;
     }
     if (expr.op_type != OpType::NONE && expr.op_type != OpType::ONE) {
-        auto var = n_m_to_var(expr.n, expr.m, var_count++);
-        scalar_mult_eqs(expr.eqs, var);
+        expr.var = n_m_to_var(expr.n, expr.m, var_count++);
+        scalar_mult_eqs(expr.eqs, expr.var);
     }
-}
-
-// ------------------------------------------------------------------
-// Helper: convert generated equation string to solver format.
-// Our internal format looks like:
-//    "1*{x0:3,3}*{x1:1,1}+2*{x1:0,3}*{x2:2,5}=9"
-// We want to convert that to:
-//    "1*x0*x1+2*x1*x2=9"
-// That is, remove each brace-enclosed bound, leaving only the variable name.
-// ------------------------------------------------------------------
-std::string format_eq(const Equation& eq, std::string& input) {
-    std::string result;
-    result.reserve(eq.text.size());
-    // We scan the string character by character.
-    for (size_t i = 0; i < eq.text.size(); ++i) {
-        char c = eq.text[i];
-        if (c == '{') {
-            // We assume the format is "{<var>:<n>,<m>}"
-            // Find the colon and then the closing brace.
-            size_t colonPos = eq.text.find(':', i);
-            size_t closePos = eq.text.find('}', i);
-            if (colonPos == std::string::npos || closePos == std::string::npos) {
-                // If something is wrong, copy the rest and break.
-                result.append(eq.text.substr(i));
-                break;
-            }
-            // Append the substring from after '{' up to the colon.
-            result.append("*");
-            result.append(eq.text.substr(i + 1, colonPos - i - 1));
-            // Skip ahead past the closing brace.
-            i = closePos;
-        } else {
-            result.push_back(c);
-        }
+    for (auto& eq : expr.eqs) {
+        eq.traversed.push_back(&expr);
     }
-    result.append("=" + std::to_string(input.size()));
-    return result;
 }
 
 // ------------------------------------------------------------------
@@ -763,22 +736,79 @@ std::string solve_eq(const std::string &equation) {
     return output.str();
 }
 
+void set_expr_with_eq(Expr& expr, const Equation& eq, const std::unordered_map<std::string, size_t>& sol) {
+    size_t sum = expr.start;
+    for (auto& ch : expr.children) {
+        if (std::find(eq.traversed.begin(), eq.traversed.end(), ch.get()) != eq.traversed.end()) {
+            ch->start = sum;
+            set_expr_with_eq(*ch, eq, sol);
+            sum += ch->size;
+        }
+    }
+    if (expr.children.empty()) {
+        expr.size = expr.group.size();
+    }
+    else {
+        expr.size = sum;
+    }
+    if (expr.op_type != OpType::ONE && expr.op_type != OpType::NONE) {
+        auto xpos = expr.var.find('x');
+        auto num = scan_number(expr.var.substr(xpos + 1));
+        auto key = std::string{"x"} + std::string{num};
+        auto mult = sol.at(key);
+        expr.size *= mult;
+    }
+}
+
+bool match(Expr& expr, const Equation& eq, const std::unordered_map<std::string, size_t>& sol, std::string_view input, size_t pos) {
+    size_t count = 1;
+    if (!expr.var.empty()) {
+        auto xpos = expr.var.find('x');
+        auto num = scan_number(expr.var.substr(xpos + 1));
+        auto key = std::string{"x"} + std::string{num};
+        count = sol.at(key);
+    }
+    if (expr.children.empty()) {
+        for (size_t i = 0; i < count; i++) {
+            auto sub = input.substr(pos, expr.group.size());
+            if (sub != expr.group) return false;
+            pos += expr.group.size();
+        }
+    }
+    else {
+        for (size_t i = 0; i < count; i++) {
+            Expr* first = nullptr;
+            for (auto& ch : expr.children) {
+                if (std::find(eq.traversed.begin(), eq.traversed.end(), ch.get()) != eq.traversed.end()) {
+                    if (!first) {
+                        first = ch.get();
+                        pos = first->start;
+                    }
+                    if (!match(*ch, eq, sol, input, pos)) return false;
+                    pos += ch->size;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 // Function to print parsed expressions for debugging
 void print_expr(const Expr& expr, int indent = 0) {
     std::string padding(indent * 2, ' ');
-    std::cout << padding
-              << "Expr:" << std::endl
-              << ", Group = \"" << expr.group
-              << "\", Op = \"" << expr.op
-              << "\", Link = \"" << expr.link
-              << "\", Op String = \"" << expr.op << "\""
-              << ", n = " << expr.n
-              << ", m = " << expr.m
-              << ", m = " << expr.m;
+    std::cout << padding << "Expr:" << std::endl
+              << padding << "  Group = \"" << expr.group << "\"" << std::endl
+              << padding << "  Op = \"" << expr.op << "\"" << std::endl
+              << padding << "  Link = \"" << expr.link << "\"" << std::endl;
+    if (expr.n > 0) {
+        std::cout << padding << "  n = " << expr.n << std::endl;
+    }
+    if (expr.m < std::numeric_limits<decltype(expr.m)>::max()) {
+        std::cout << padding << "  m = " << expr.m << std::endl;
+    }
 
     for (auto& eq : expr.eqs) {
-        std::cout << padding
-                  << eq.text << std::endl;
+        std::cout << padding << "  " << eq.text << std::endl;
     }
 
     for (const auto& child : expr.children) {
@@ -851,7 +881,94 @@ void test_parse() {
     {
         auto expr = parse("[[:alnum:]\\x61-\\x7A\t]");
     }
+}
 
+// Trim leading and trailing whitespace.
+std::string trim(const std::string &s) {
+    size_t start = s.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) return "";
+    size_t end = s.find_last_not_of(" \t\r\n");
+    return s.substr(start, end - start + 1);
+}
+
+// Remove surrounding single quotes if present.
+std::string remove_quotes(const std::string &s) {
+    if (s.size() >= 2 && s.front() == '\'' && s.back() == '\'') {
+        return s.substr(1, s.size() - 2);
+    }
+    return s;
+}
+
+// Manually parse a dictionary string like "{'x0':4, 'x1':2}" and return a map.
+std::unordered_map<std::string, size_t> parse_dictionary(const std::string &dict_str) {
+    std::unordered_map<std::string, size_t> result;
+    // Expect the string to start with '{' and end with '}'.
+    size_t start_brace = dict_str.find('{');
+    size_t end_brace = dict_str.find('}');
+    if (start_brace == std::string::npos || end_brace == std::string::npos || end_brace <= start_brace)
+        return result;
+    
+    // Extract the content inside the braces.
+    std::string content = dict_str.substr(start_brace + 1, end_brace - start_brace - 1);
+    // Use a stringstream to split by commas.
+    std::istringstream iss(content);
+    std::string token;
+    while (std::getline(iss, token, ',')) {
+        token = trim(token);
+        if (token.empty())
+            continue;
+        // Find the colon.
+        size_t colon_pos = token.find(':');
+        if (colon_pos == std::string::npos)
+            continue;
+        std::string key = trim(token.substr(0, colon_pos));
+        std::string value_str = trim(token.substr(colon_pos + 1));
+        // Remove quotes from key if any.
+        key = remove_quotes(key);
+        size_t value = 0;
+        std::from_chars(value_str.data(), value_str.data() + value_str.size(), value);
+        result[key] = value;
+    }
+    return result;
+}
+
+// Parse the solver's entire output into a vector of maps.
+std::vector<std::unordered_map<std::string, size_t>> parse_solver_output(const std::string &solver_output) {
+    std::vector<std::unordered_map<std::string, size_t>> solutions;
+    std::istringstream iss(solver_output);
+    std::string line;
+    
+    while (std::getline(iss, line)) {
+        line = trim(line);
+        if (line.empty()) continue;
+        // We expect the line to contain a dictionary: starting with '{'
+        if (line[0] != '{') continue;
+        // find the closing brace
+        auto pos = line.find('}');
+        if (pos == std::string::npos) continue; // no closing brace => skip
+        
+        // Extract just the dictionary portion
+        std::string dict_portion = line.substr(0, pos + 1);
+        
+        // Parse that dictionary
+        auto sol_map = parse_dictionary(dict_portion);
+        if (!sol_map.empty())
+            solutions.push_back(std::move(sol_map));
+    }
+    return solutions;
+}
+
+// Helper: print parsed solutions.
+void print_parsed_solutions(const std::vector<std::unordered_map<std::string, size_t>> &solutions) {
+    std::cout << "Parsed candidate solutions:\n";
+    for (const auto &sol : solutions) {
+        std::cout << "{ ";
+        for (const auto &kv : sol) {
+            std::cout << kv.first << "=" << kv.second << " ";
+        }
+        std::cout << "}\n";
+    }
+    std::cout << "\n";
 }
 
 int main() {
@@ -894,30 +1011,36 @@ int main() {
     print_expr(*expr);
     
     // Debug: print the generated equations.
-    std::cout << "Generated equations (internal format):" << std::endl;
+    std::cout << "Generated equations:" << std::endl;
     for (const auto &eq : expr->eqs) {
-        std::cout << eq.text << std::endl;
+        std::string with_rhs = eq.text + "=" + std::to_string(input.size());
+        std::cout << with_rhs << std::endl;
     }
-    
-    // Step 3. Convert each generated equation into the format expected by the Python solver.
-    std::vector<std::string> formatted_eqs;
-    for (const auto &eq : expr->eqs) {
-        std::string feq = format_eq(eq, input);
-        formatted_eqs.push_back(feq);
-    }
-    
-    // Debug: print the formatted equations.
-    std::cout << "\nFormatted equations (solver format):" << std::endl;
-    for (const auto &eq : formatted_eqs) {
-        std::cout << eq << std::endl;
-    }
-    
+
     // Step 4. For each converted equation, call the Python solver and output its result.
     std::cout << "\nSolutions from Python solver:" << std::endl;
-    for (const auto &eq : formatted_eqs) {
-        std::cout << "For equation: " << eq << std::endl;
-        std::string solverOutput = solve_eq(eq);
-        std::cout << solverOutput << std::endl;
+    for (const auto &eq : expr->eqs) {
+        std::string with_rhs = eq.text + "=" + std::to_string(input.size());
+        std::cout << "For equation: " << with_rhs << std::endl;
+        std::string solver_output = solve_eq(with_rhs);
+        std::cout << solver_output << std::endl;
+        auto sols = parse_solver_output(solver_output);
+        print_parsed_solutions(sols);
+        bool any_match = false;
+        for (auto& s : sols) {
+            auto& first = *(expr->children[0]);
+            set_expr_with_eq(first, eq, s);
+            if (match(first, eq, s, input, 0)) {
+                any_match = true;
+                std::cout << "matched " << eq.text << " with ";
+                std::cout << "{ ";
+                for (const auto &kv : s) {
+                    std::cout << kv.first << "=" << kv.second << " ";
+                }
+                std::cout << "}" << std::endl << std::endl;
+            }
+        }
+        if (!any_match) std::cout << "no matches" << std::endl;
     }
     return 0;
 }
