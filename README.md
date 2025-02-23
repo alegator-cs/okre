@@ -3,6 +3,8 @@ This is a depth-range-diophantine CSL parser/matcher/enumerator, an original alg
 Planned Refactor Changes:
 The current approach generates a lot of equations and handles alternations in a way that makes backrefs difficult to deal with. The new algorithm will generate equations differently. Alternations will not "branch" equations anymore, instead, the terms of each alternation in a chain will be summed with binary factors that sum to 1, e.g. "(a|bc+|def)\1" -> (b0(1) + b1(1+x0) + b2(3)) + (b0(1) + b1(1+x0) + b2(3)), b0+b1+b2=1. This means there is no longer a need for multiple independent equations per expr, nor for a cartesian product operation. Instead there will be one main equation generated, along with simple auxiliary equations for the binary toggle vars "bvars" to sum to 1, that form a system.
 
+u/sepp2k from Reddit pointed out that the candidate solution enumeration is exponential, but this can be fixed: the solver will generate solution candidates using a knapsack-style bounded subset-sum dynamic programming approach.
+
 Summary:
 Generate a parse tree from the expression where groups nest. Generate equation fragments bottom-up, where
   leaf => add group size constant
