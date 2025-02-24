@@ -5,6 +5,10 @@ The current approach generates a lot of equations and handles alternations in a 
 
 u/sepp2k from Reddit pointed out that the candidate solution enumeration is exponential, but this can be fixed: the solver will generate solution candidates using a knapsack-style bounded subset-sum dynamic programming approach.
 
+2/24/25 realized the new format permits a bubble up optimization pass that should result in only equations that have a match being generated, which is a massive optimization. This comes follows from the idea that alternations are the source of multiple equations, but after the parse tree is generated, it's possible to cheaply iterate the input with simple searches and range checks to determine which alternations cannot be used, proceeding up the depth levels.
+
+So far, I cannot see any reason this algorithm will not run in polynomial time.
+
 Summary:
 Generate a parse tree from the expression where groups nest. Generate equation fragments bottom-up, where
   leaf => add group size constant
